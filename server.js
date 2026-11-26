@@ -95,12 +95,128 @@ function detectarTipo(b) {
 // -----------------------------------------------------------------------------
 // OCR de un archivo
 // -----------------------------------------------------------------------------
-async function ocrImagen(buffer, idioma) {
-  // Tesseract lee la imagen desde stdin: no se escribe nada en disco
-  return limpiar(await ejecutar('tesseract', ['stdin', 'stdout', '-l', idioma, '--psm', '3'], buffer));
+// Tesseract en modo TSV: devuelve cada palabra con su posición y confianza.
+// "entrada" puede ser un Buffer (se pasa por stdin, sin tocar disco) o una ruta.
+async function tesseractPalabras(entrada, idioma) {
+  const esRuta = typeof entrada === 'string';
+  const tsv = await ejecutar('tesseract',
+    [esRuta ? entrada : 'stdin', 'stdout', '-l', idioma, '--psm', '3', 'tsv'],
+    esRuta ? null : entrada);
+  const palabras = [];
+  for (const fila of tsv.split('\n')) {
+    const c = fila.split('\t');
+    if (c.length < 12 || c[0] !== '5') continue; // nivel 5 = palabra
+    const texto = c.slice(11).join(' ').trim();
+    const conf = Number(c[10]);
+    if (!texto || !(conf >= 0)) continue;
+    palabras.push({ linea: c[2] + '.' + c[3] + '.' + c[4], x: +c[6], y: +c[7], w: +c[8], h: +c[9], conf, texto });
+  }
+  return palabras;
 }
 
-async function ocrPdf(buffer, idioma) {
+const mediana = (arr) => { const s = arr.slice().sort((a, b) => a - b); return s[s.length >> 1] || 0; };
+
+function armarSegmento(ws) {
+  const x = Math.min(...ws.map((w) => w.x));
+  const y = Math.min(...ws.map((w) => w.y));
+  return {
+    x, y,
+    der: Math.max(...ws.map((w) => w.x + w.w)),
+    abajo: Math.max(...ws.map((w) => w.y + w.h)),
+    alto: mediana(ws.map((w) => w.h)),
+    conf: ws.reduce((s, w) => s + w.conf, 0) / ws.length,
+    palabras: ws,
+    texto: ws.map((w) => w.texto).join(' '),
+  };
+}
+
+const solapeX = (a, b) => Math.min(a.der, b.der) - Math.max(a.x, b.x);
+const solapeY = (a, b) => Math.min(a.abajo, b.abajo) - Math.max(a.y, b.y);
+
+// Reconstruye el orden de lectura a partir de las posiciones de las palabras:
+//  1) corta renglones donde hay huecos grandes (columnas, tarjetas lado a lado)
+//  2) descarta ruido (logos e íconos leídos como letras sueltas con baja confianza)
+//  3) agrupa los trozos en "flujos" (columnas / párrafos) y los ordena
+function reconstruirTexto(palabras) {
+  // 0) Ruido a nivel palabra: íconos/logos que Tesseract lee como 1-2 caracteres con baja confianza
+  palabras = palabras.filter((w) => {
+    const utiles = w.texto.replace(/[^\p{L}\p{N}]/gu, '').length;
+    if (utiles === 0 && w.conf < 60) return false;
+    if (utiles <= 2 && w.conf < 40) return false;
+    return w.conf >= 15;
+  });
+
+  // 1) Renglones de Tesseract -> segmentos
+  const lineas = new Map();
+  for (const w of palabras) {
+    if (!lineas.has(w.linea)) lineas.set(w.linea, []);
+    lineas.get(w.linea).push(w);
+  }
+  let segmentos = [];
+  for (const ws of lineas.values()) {
+    ws.sort((a, b) => a.x - b.x);
+    const umbral = Math.max(2.5 * mediana(ws.map((w) => w.h)), 24);
+    let actual = [ws[0]];
+    for (let i = 1; i < ws.length; i++) {
+      const hueco = ws[i].x - (ws[i - 1].x + ws[i - 1].w);
+      if (hueco > umbral) { segmentos.push(armarSegmento(actual)); actual = []; }
+      actual.push(ws[i]);
+    }
+    segmentos.push(armarSegmento(actual));
+  }
+
+  // 2) Ruido: trozos cortos con baja confianza, o cualquier trozo casi ilegible
+  segmentos = segmentos.filter((s) => {
+    const utiles = s.texto.replace(/[^\p{L}\p{N}]/gu, '').length;
+    if (utiles === 0) return false;
+    if (s.conf < 50 && utiles <= 3) return false;
+    return s.conf >= 30;
+  });
+  if (segmentos.length === 0) return { texto: '', confianza: 0 };
+
+  // 3) Flujos: un trozo continúa un flujo si está justo debajo y alineado con él
+  segmentos.sort((a, b) => a.y - b.y || a.x - b.x);
+  const flujos = [];
+  for (const s of segmentos) {
+    const vecinos = segmentos.filter((o) => o !== s && solapeY(o, s) > 0.5 * Math.min(o.abajo - o.y, s.abajo - s.y));
+    let mejor = null, mejorHueco = Infinity;
+    for (const f of flujos) {
+      const u = f.ultimo;
+      const alto = Math.max(u.alto, s.alto);
+      const hueco = s.y - u.abajo;
+      if (hueco < -0.5 * alto || hueco > 1.3 * alto) continue;              // muy lejos verticalmente
+      if (Math.max(u.alto, s.alto) > 1.8 * Math.min(u.alto, s.alto)) continue; // tamaño de letra muy distinto (logo/título)
+      if (solapeX(u, s) < 0.3 * Math.min(u.der - u.x, s.der - s.x)) continue; // no alineado
+      if (vecinos.some((v) => solapeX(u, v) > 0)) continue;                 // u abarca varias columnas
+      if (hueco < mejorHueco) { mejor = f; mejorHueco = hueco; }
+    }
+    if (mejor) { mejor.segs.push(s); mejor.ultimo = s; }
+    else flujos.push({ segs: [s], ultimo: s, y: s.y, x: s.x, alto: s.alto });
+  }
+
+  // Orden de lectura: de arriba hacia abajo; si arrancan a la misma altura, de izquierda a derecha
+  flujos.sort((a, b) => {
+    const tolerancia = 0.6 * Math.max(a.alto, b.alto);
+    return Math.abs(a.y - b.y) <= tolerancia ? a.x - b.x : a.y - b.y;
+  });
+
+  const usadas = segmentos.flatMap((s) => s.palabras);
+  return {
+    texto: flujos.map((f) => f.segs.map((s) => s.texto).join('\n')).join('\n\n'),
+    confianza: Math.round(usadas.reduce((t, w) => t + w.conf, 0) / usadas.length) / 100,
+  };
+}
+
+async function ocrImagen(entrada, idioma, modo) {
+  if (modo === 'crudo') {
+    const esRuta = typeof entrada === 'string';
+    const t = await ejecutar('tesseract', [esRuta ? entrada : 'stdin', 'stdout', '-l', idioma, '--psm', '3'], esRuta ? null : entrada);
+    return { texto: limpiar(t) };
+  }
+  return reconstruirTexto(await tesseractPalabras(entrada, idioma));
+}
+
+async function ocrPdf(buffer, idioma, modo) {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'ocr-'));
   try {
     const archivo = path.join(dir, 'doc.pdf');
@@ -116,7 +232,8 @@ async function ocrPdf(buffer, idioma) {
     }
 
     // 1) PDF digital: extraer la capa de texto (instantáneo)
-    const texto = limpiar(await ejecutar('pdftotext', ['-layout', '-enc', 'UTF-8', archivo, '-']));
+    // (sin -layout: así respeta el orden de lectura de las columnas)
+    const texto = limpiar(await ejecutar('pdftotext', ['-enc', 'UTF-8', archivo, '-']));
     if (texto.replace(/\s+/g, '').length >= 20) {
       return { tipo: 'pdf', metodo: 'capa-de-texto', paginas, texto };
     }
@@ -125,21 +242,24 @@ async function ocrPdf(buffer, idioma) {
     const total = Math.min(paginas || 1, MAX_PAGINAS);
     await ejecutar('pdftoppm', ['-r', '200', '-gray', '-png', '-f', '1', '-l', String(total), archivo, path.join(dir, 'p')]);
     const imagenes = (await fs.readdir(dir)).filter((f) => f.startsWith('p') && f.endsWith('.png')).sort();
-    const partes = [];
+    const partes = [], confs = [];
     for (let i = 0; i < imagenes.length; i++) {
-      const t = limpiar(await ejecutar('tesseract', [path.join(dir, imagenes[i]), 'stdout', '-l', idioma, '--psm', '3']));
-      partes.push((imagenes.length > 1 ? '--- Página ' + (i + 1) + ' ---\n' : '') + t);
+      const r = await ocrImagen(path.join(dir, imagenes[i]), idioma, modo);
+      partes.push((imagenes.length > 1 ? '--- Página ' + (i + 1) + ' ---\n' : '') + r.texto);
+      if (r.confianza) confs.push(r.confianza);
       await fs.rm(path.join(dir, imagenes[i]), { force: true });
     }
     let final = partes.join('\n\n');
     if (paginas > MAX_PAGINAS) final += '\n\n[Se procesaron solo las primeras ' + MAX_PAGINAS + ' de ' + paginas + ' páginas]';
-    return { tipo: 'pdf', metodo: 'ocr', paginas: total, texto: final };
+    const res = { tipo: 'pdf', metodo: 'ocr', paginas: total, texto: final };
+    if (confs.length) res.confianza = Math.round((confs.reduce((a, b) => a + b, 0) / confs.length) * 100) / 100;
+    return res;
   } finally {
     await fs.rm(dir, { recursive: true, force: true });
   }
 }
 
-async function procesarArchivo(buffer, nombre, idioma) {
+async function procesarArchivo(buffer, nombre, idioma, modo) {
   if (!buffer || buffer.length === 0) throw new HttpError(400, 'SIN_ARCHIVO', 'El archivo está vacío.');
   if (buffer.length > MAX_BYTES) throw new HttpError(413, 'ARCHIVO_DEMASIADO_GRANDE', 'El archivo supera los 10 MB.');
   const tipo = detectarTipo(buffer);
@@ -149,8 +269,8 @@ async function procesarArchivo(buffer, nombre, idioma) {
       'Acepta JPG, PNG, WEBP, GIF, BMP, TIFF y PDF. La página web convierte otros formatos automáticamente.');
   }
   return enCola(async () => {
-    if (tipo === 'pdf') return { nombre, ...(await ocrPdf(buffer, idioma)) };
-    return { nombre, tipo: 'imagen', formato: tipo, metodo: 'ocr', texto: await ocrImagen(buffer, idioma) };
+    if (tipo === 'pdf') return { nombre, ...(await ocrPdf(buffer, idioma, modo)) };
+    return { nombre, tipo: 'imagen', formato: tipo, metodo: 'ocr', ...(await ocrImagen(buffer, idioma, modo)) };
   });
 }
 
@@ -216,6 +336,8 @@ async function manejarOcr(req, res, url) {
 
   const ct = String(req.headers['content-type'] || '');
   let idioma = url.searchParams.get('idioma') || 'spa';
+  // modo=auto (por defecto: reconstruye columnas y párrafos) | crudo (salida tal cual de Tesseract)
+  let modo = url.searchParams.get('modo') || 'auto';
   let archivos = [];
 
   try {
@@ -228,6 +350,7 @@ async function manejarOcr(req, res, url) {
       try { form = await peticion.formData(); }
       catch (e) { if (e instanceof HttpError) throw e; if (e && e.cause instanceof HttpError) throw e.cause; throw new HttpError(400, 'MULTIPART_INVALIDO', 'No se pudo leer el formulario.', String(e && e.message)); }
       idioma = String(form.get('idioma') || idioma);
+      modo = String(form.get('modo') || modo);
       for (const campo of ['archivos', 'archivo', 'file', 'files']) {
         for (const f of form.getAll(campo)) {
           if (f && typeof f !== 'string') archivos.push({ nombre: f.name || 'archivo', tam: f.size, blob: f });
@@ -257,7 +380,7 @@ async function manejarOcr(req, res, url) {
       if (a.tam > MAX_BYTES) throw new HttpError(413, 'ARCHIVO_DEMASIADO_GRANDE', 'El archivo supera los 10 MB.');
       const buffer = a.buffer || Buffer.from(await a.blob.arrayBuffer());
       a.blob = null; a.buffer = null;
-      resultados.push({ ok: true, ...(await procesarArchivo(buffer, a.nombre, idioma)) });
+      resultados.push({ ok: true, ...(await procesarArchivo(buffer, a.nombre, idioma, modo === 'crudo' ? 'crudo' : 'auto')) });
     } catch (e) {
       resultados.push({ ...errorJson(e, a.nombre), _status: e instanceof HttpError ? e.status : 500 });
     }
@@ -490,6 +613,8 @@ const HTML_PAGE = String.raw`<!DOCTYPE html>
     var carga = window.createImageBitmap ? createImageBitmap(file).catch(function () { return conImg(file); }) : conImg(file);
     return carga.then(function (img) {
       var w = img.naturalWidth || img.width, h = img.naturalHeight || img.height;
+      // PNG/JPG que ya tienen buen tamaño: se mandan tal cual (sin recomprimir = texto más nítido)
+      if ((file.type === 'image/png' || file.type === 'image/jpeg') && Math.max(w, h) <= MAX_LADO) return file;
       var esc = Math.min(1, MAX_LADO / Math.max(w, h));
       var c = document.createElement('canvas');
       c.width = Math.round(w * esc); c.height = Math.round(h * esc);
@@ -535,7 +660,8 @@ const HTML_PAGE = String.raw`<!DOCTYPE html>
       ? Promise.resolve(t.file)
       : prepararImagen(t.file);
     paso.then(function (blob) {
-      return enviar(blob, esPdf ? t.file.name : (t.file.name || 'imagen').replace(/\.[^.]+$/, '') + '.jpg');
+      var nombreEnvio = (esPdf || blob === t.file) ? (t.file.name || 'archivo') : (t.file.name || 'imagen').replace(/\.[^.]+$/, '') + '.jpg';
+      return enviar(blob, nombreEnvio);
     }).then(function (data) {
       if (!data.ok) throw new Error(data.detalles ? data.error + ' ' + data.detalles : data.error);
       marcarOk(t.item, data, ((performance.now() - t0) / 1000).toFixed(1));
