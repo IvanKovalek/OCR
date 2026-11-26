@@ -142,6 +142,7 @@ function reconstruirTexto(palabras) {
   palabras = palabras.filter((w) => {
     const utiles = w.texto.replace(/[^\p{L}\p{N}]/gu, '').length;
     if (utiles === 0 && w.conf < 60) return false;
+    if (utiles === 0 && w.texto.length === 1 && !'-–—·•&%=/:'.includes(w.texto)) return false;
     if (utiles <= 2 && w.conf < 40) return false;
     return w.conf >= 15;
   });
@@ -153,7 +154,19 @@ function reconstruirTexto(palabras) {
     lineas.get(w.linea).push(w);
   }
   let segmentos = [];
-  for (const ws of lineas.values()) {
+  for (let ws of lineas.values()) {
+    // Íconos/logos: "letra" suelta (1-2 caracteres) mucho más alta que las palabras del renglón
+    const hTexto = mediana(ws.filter((w) => w.texto.replace(/[^\p{L}\p{N}]/gu, '').length >= 3).map((w) => w.h));
+    if (hTexto) {
+      // ...o que no está apoyada en el renglón (su base queda muy arriba o muy abajo de la de las palabras)
+      const base = mediana(ws.filter((w) => w.texto.replace(/[^\p{L}\p{N}]/gu, '').length >= 3).map((w) => w.y + w.h));
+      ws = ws.filter((w) => {
+        if (w.texto.replace(/[^\p{L}\p{N}]/gu, '').length > 2 || w.conf >= 90) return true;
+        if (w.h > 1.6 * hTexto) return false;
+        return Math.abs(w.y + w.h - base) <= 0.45 * hTexto;
+      });
+    }
+    if (ws.length === 0) continue;
     ws.sort((a, b) => a.x - b.x);
     const umbral = Math.max(2.5 * mediana(ws.map((w) => w.h)), 24);
     let actual = [ws[0]];
@@ -185,7 +198,7 @@ function reconstruirTexto(palabras) {
       const alto = Math.max(u.alto, s.alto);
       const hueco = s.y - u.abajo;
       if (hueco < -0.5 * alto || hueco > 1.3 * alto) continue;              // muy lejos verticalmente
-      if (Math.max(u.alto, s.alto) > 1.8 * Math.min(u.alto, s.alto)) continue; // tamaño de letra muy distinto (logo/título)
+      if (Math.max(u.alto, s.alto) > 2 * Math.min(u.alto, s.alto)) continue; // tamaño de letra muy distinto (logo/título)
       if (solapeX(u, s) < 0.3 * Math.min(u.der - u.x, s.der - s.x)) continue; // no alineado
       if (vecinos.some((v) => solapeX(u, v) > 0)) continue;                 // u abarca varias columnas
       if (hueco < mejorHueco) { mejor = f; mejorHueco = hueco; }
@@ -200,9 +213,37 @@ function reconstruirTexto(palabras) {
     return Math.abs(a.y - b.y) <= tolerancia ? a.x - b.x : a.y - b.y;
   });
 
+  // Una letra suelta y aislada (no un número) casi siempre es un dibujo: flecha, ícono, viñeta.
+  // Se conserva si hay otro texto en la misma fila (ej. opciones "A  B  C" o celdas de tabla).
+  for (let i = flujos.length - 1; i >= 0; i--) {
+    const f = flujos[i];
+    if (f.segs.length !== 1 || f.segs[0].palabras.length !== 1) continue;
+    if (!/^\p{L}[.,;:!?¡¿)]?$/u.test(f.segs[0].palabras[0].texto)) continue;
+    const s0 = f.segs[0];
+    const enFila = segmentos.some((o) => o !== s0 && solapeY(o, s0) > 0.5 * Math.min(o.abajo - o.y, s0.abajo - s0.y));
+    if (!enFila) flujos.splice(i, 1);
+  }
+
+  // Flujos de un solo trozo alineados en la misma fila (números en recuadros, celdas sueltas)
+  // se escriben en una sola línea separados por espacios, en vez de un bloque cada uno.
+  const bloques = [];
+  for (const f of flujos) {
+    const prev = bloques[bloques.length - 1];
+    if (f.segs.length === 1 && prev && prev.fila &&
+        Math.abs(prev.y - f.y) <= 0.6 * Math.max(prev.alto, f.alto) && f.x > prev.der) {
+      prev.texto += '   ' + f.segs[0].texto;
+      prev.der = f.segs[0].der;
+      continue;
+    }
+    bloques.push({
+      texto: f.segs.map((s) => s.texto).join('\n'),
+      fila: f.segs.length === 1, y: f.y, alto: f.alto, der: f.segs[0].der,
+    });
+  }
+
   const usadas = segmentos.flatMap((s) => s.palabras);
   return {
-    texto: flujos.map((f) => f.segs.map((s) => s.texto).join('\n')).join('\n\n'),
+    texto: bloques.map((b) => b.texto).join('\n\n'),
     confianza: Math.round(usadas.reduce((t, w) => t + w.conf, 0) / usadas.length) / 100,
   };
 }
@@ -213,7 +254,22 @@ async function ocrImagen(entrada, idioma, modo) {
     const t = await ejecutar('tesseract', [esRuta ? entrada : 'stdin', 'stdout', '-l', idioma, '--psm', '3'], esRuta ? null : entrada);
     return { texto: limpiar(t) };
   }
-  return reconstruirTexto(await tesseractPalabras(entrada, idioma));
+  return reconstruirTexto(await palabrasRobustas(entrada, idioma));
+}
+
+// Preprocesado (OpenCV) + varias pasadas de Tesseract: ver preprocesar.py.
+// Si Python fallara por algo inesperado, se cae a una pasada simple de Tesseract.
+const SCRIPT_PREPROCESO = path.join(__dirname, 'preprocesar.py');
+async function palabrasRobustas(entrada, idioma) {
+  const esRuta = typeof entrada === 'string';
+  try {
+    const salida = await ejecutar('python3', [SCRIPT_PREPROCESO, idioma].concat(esRuta ? [entrada] : []), esRuta ? null : entrada);
+    return JSON.parse(salida).palabras;
+  } catch (e) {
+    if (e instanceof HttpError) throw e;
+    console.error('Preprocesado falló, uso Tesseract directo:', e.message);
+    return tesseractPalabras(entrada, idioma);
+  }
 }
 
 async function ocrPdf(buffer, idioma, modo) {
@@ -222,9 +278,9 @@ async function ocrPdf(buffer, idioma, modo) {
     const archivo = path.join(dir, 'doc.pdf');
     await fs.writeFile(archivo, buffer);
 
-    let paginas = 0;
+    let paginas = 0, info = '';
     try {
-      const info = await ejecutar('pdfinfo', [archivo]);
+      info = await ejecutar('pdfinfo', [archivo]);
       const m = info.match(/^Pages:\s+(\d+)/m);
       paginas = m ? Number(m[1]) : 0;
     } catch (e) {
@@ -240,7 +296,11 @@ async function ocrPdf(buffer, idioma, modo) {
 
     // 2) PDF escaneado: rasterizar cada página y pasarla por OCR
     const total = Math.min(paginas || 1, MAX_PAGINAS);
-    await ejecutar('pdftoppm', ['-r', '200', '-gray', '-png', '-f', '1', '-l', String(total), archivo, path.join(dir, 'p')]);
+    // Resolución según el tamaño de la página: ~3000 px de lado mayor (entre 72 y 300 dpi)
+    const tam = info.match(/^Page size:\s+([\d.]+) x ([\d.]+) pts/m);
+    const ladoPts = tam ? Math.max(Number(tam[1]), Number(tam[2])) : 842;
+    const dpi = Math.round(Math.min(300, Math.max(72, 3000 / (ladoPts / 72))));
+    await ejecutar('pdftoppm', ['-r', String(dpi), '-gray', '-png', '-f', '1', '-l', String(total), archivo, path.join(dir, 'p')]);
     const imagenes = (await fs.readdir(dir)).filter((f) => f.startsWith('p') && f.endsWith('.png')).sort();
     const partes = [], confs = [];
     for (let i = 0; i < imagenes.length; i++) {
