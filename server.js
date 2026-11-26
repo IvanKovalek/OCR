@@ -72,6 +72,16 @@ function ejecutar(cmd, args, entrada) {
   });
 }
 
+// Errores típicos de Tesseract con símbolos
+function corregirSimbolos(t) {
+  return t
+    .replace(/(\d)\s?[*º]\s?([CF])\b/g, '$1 °$2')        // 38,9 *C -> 38,9 °C
+    .replace(/\bN\s?[*º]\s?(?=\d)/g, 'N° ')                 // N* 4821 -> N° 4821
+    .replace(/([\w.+-])\s+@\s*([\w-]+\.)/g, '$1@$2')       // vet @ clinica.com
+    .replace(/([\w.+-])@\s+([\w-]+\.)/g, '$1@$2')
+    .replace(/[ \t]+$/gm, '');
+}
+
 function limpiar(texto) {
   return texto.replace(/\f/g, '').replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -147,6 +157,10 @@ function reconstruirTexto(palabras) {
     return w.conf >= 15;
   });
 
+  // Motas: palabras diminutas comparadas con el texto del documento (puntos sueltos, restos)
+  const hDoc = mediana(palabras.filter((w) => w.texto.replace(/[^\p{L}\p{N}]/gu, '').length >= 3).map((w) => w.h));
+  if (hDoc) palabras = palabras.filter((w) => w.h >= 0.35 * hDoc || w.conf >= 90);
+
   // 1) Renglones de Tesseract -> segmentos
   const lineas = new Map();
   for (const w of palabras) {
@@ -168,6 +182,13 @@ function reconstruirTexto(palabras) {
     }
     if (ws.length === 0) continue;
     ws.sort((a, b) => a.x - b.x);
+    if (ws[0].linea.startsWith('t')) {
+      // fila de una tabla detectada: un solo trozo, celdas separadas por espacios
+      const seg = armarSegmento(ws);
+      seg.texto = ws.map((w, i) => (i > 0 && w.celda !== ws[i - 1].celda ? '   ' : (i > 0 ? ' ' : '')) + w.texto).join('');
+      segmentos.push(seg);
+      continue;
+    }
     const umbral = Math.max(2.5 * mediana(ws.map((w) => w.h)), 24);
     let actual = [ws[0]];
     for (let i = 1; i < ws.length; i++) {
@@ -209,7 +230,7 @@ function reconstruirTexto(palabras) {
 
   // Orden de lectura: de arriba hacia abajo; si arrancan a la misma altura, de izquierda a derecha
   flujos.sort((a, b) => {
-    const tolerancia = 0.6 * Math.max(a.alto, b.alto);
+    const tolerancia = 0.5 * Math.min(a.alto, b.alto);
     return Math.abs(a.y - b.y) <= tolerancia ? a.x - b.x : a.y - b.y;
   });
 
@@ -254,7 +275,9 @@ async function ocrImagen(entrada, idioma, modo) {
     const t = await ejecutar('tesseract', [esRuta ? entrada : 'stdin', 'stdout', '-l', idioma, '--psm', '3'], esRuta ? null : entrada);
     return { texto: limpiar(t) };
   }
-  return reconstruirTexto(await palabrasRobustas(entrada, idioma));
+  const r = reconstruirTexto(await palabrasRobustas(entrada, idioma));
+  r.texto = corregirSimbolos(r.texto);
+  return r;
 }
 
 // Preprocesado (OpenCV) + varias pasadas de Tesseract: ver preprocesar.py.
